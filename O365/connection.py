@@ -271,7 +271,7 @@ class Connection:
     def __init__(self, credentials, *, scopes=None,
                  proxy_server=None, proxy_port=8080, proxy_username=None,
                  proxy_password=None, requests_delay=200, raise_http_errors=True,
-                 request_retries=3, token_file_name=None, token_backend=None,
+                 request_retries=3, token_backend=None,
                  tenant_id='common', **kwargs):
         """ Creates an API connection object
 
@@ -294,8 +294,6 @@ class Connection:
          will raise as exceptions
         :param int request_retries: number of retries done when the server
          responds with 5xx error codes.
-        :param str token_file_name: custom token file name to be used when
-         storing the OAuth token credentials.
         :param BaseTokenBackend token_backend: the token backend used to get
          and store tokens
         :param str tenant_id: use this specific tenant id, defaults to common
@@ -310,11 +308,7 @@ class Connection:
         self.auth = credentials
         self.scopes = scopes
         self.store_token = True
-        # TODO: remove "token_file_name" in a future release
-        if token_file_name is not None:
-            warnings.warn('"token_file_name" will be removed in future versions.'
-                          ' Please use "token_backend" instead', DeprecationWarning)
-        token_backend = token_backend or FileSystemTokenBackend(token_filename=token_file_name)
+        token_backend = token_backend or FileSystemTokenBackend()
         if not isinstance(token_backend, BaseTokenBackend):
             raise ValueError('"token_backend" must be an instance of a subclass of BaseTokenBackend')
         self.token_backend = token_backend
@@ -327,17 +321,7 @@ class Connection:
         self.raise_http_errors = raise_http_errors
         self.request_retries = request_retries
 
-        self.naive_session = Session()  # requests Session object
-        self.naive_session.proxies = self.proxy
-
-        if self.request_retries:
-            retry = Retry(total=self.request_retries, read=self.request_retries,
-                          connect=self.request_retries,
-                          backoff_factor=RETRIES_BACKOFF_FACTOR,
-                          status_forcelist=RETRIES_STATUS_LIST)
-            adapter = HTTPAdapter(max_retries=retry)
-            self.naive_session.mount('http://', adapter)
-            self.naive_session.mount('https://', adapter)
+        self.naive_session = None  # lazy loaded: holds a requests Session object
 
         self._oauth2_authorize_url = 'https://login.microsoftonline.com/' \
                                      '{}/oauth2/v2.0/authorize'.format(tenant_id)
@@ -371,17 +355,6 @@ class Connection:
                     "https": "https://{}:{}".format(proxy_server, proxy_port),
                 }
 
-    def check_token_file(self):
-        """ Checks if the token file exists at the given position
-
-        :return: if file exists or not
-        :rtype: bool
-        """
-        # TODO: remove this method in a future release
-        warnings.warn('This method will be removed in future versions',
-                      DeprecationWarning)
-        return self.token_backend.check_token() if hasattr(self.token_backend, 'check_token') else None
-
     def get_authorization_url(self, requested_scopes=None,
                               redirect_uri=OAUTH_REDIRECT_URL, **kwargs):
         """ Initializes the oauth authorization flow, getting the
@@ -394,12 +367,11 @@ class Connection:
         :rtype: str
         """
 
-        # TODO: remove this warning in future releases
-        if redirect_uri == OAUTH_REDIRECT_URL:
-            warnings.warn('The default redirect uri was changed in version 1.1.4. to'
-                          ' "https://login.microsoftonline.com/common/oauth2/nativeclient".'
-                          ' You may have to change the registered app "redirect uri" or pass here the old "redirect_uri"',
-                          DeprecationWarning)
+        client_id, client_secret = self.auth
+        scopes = requested_scopes or self.scopes
+        if not scopes:
+            raise ValueError('Must provide at least one scope')
+
         self.session = oauth = self.get_session(redirect_uri=redirect_uri,
                                                 scopes=requested_scopes)
 
@@ -437,10 +409,6 @@ class Connection:
             raise RuntimeError("First call 'get_authorization_url' to "
                                "generate a valid oauth object and state")
 
-        # TODO: remove token_path in future versions
-        if token_path is not None:
-            warnings.warn('"token_path" param will be removed in future versions.'
-                          ' Use a TokenBackend instead', DeprecationWarning)
         _, client_secret = self.auth
 
         # Allow token scope to not match requested scope.
@@ -479,10 +447,6 @@ class Connection:
         :return: A ready to use requests session, or a rebuilt in-flow session
         :rtype: OAuth2Session
         """
-        # TODO: remove token_path in future versions
-        if token_path is not None:
-            warnings.warn('"token_path" param will be removed in future versions.'
-                          ' Use a TokenBackend instead.', DeprecationWarning)
 
         # gets a fresh token from the store
         token = self.token_backend.get_token()
@@ -515,6 +479,22 @@ class Connection:
             session.mount('https://', adapter)
 
         return session
+
+    def get_naive_session(self):
+        """ Creates and returns a naive session """
+        naive_session = Session()  # requests Session object
+        naive_session.proxies = self.proxy
+
+        if self.request_retries:
+            retry = Retry(total=self.request_retries, read=self.request_retries,
+                          connect=self.request_retries,
+                          backoff_factor=RETRIES_BACKOFF_FACTOR,
+                          status_forcelist=RETRIES_STATUS_LIST)
+            adapter = HTTPAdapter(max_retries=retry)
+            naive_session.mount('http://', adapter)
+            naive_session.mount('https://', adapter)
+
+        return naive_session
 
     def refresh_token(self):
         """
@@ -654,6 +634,9 @@ class Connection:
         :return: Response of the request
         :rtype: requests.Response
         """
+        if self.naive_session is None:
+            # lazy creation of a naive session
+            self.naive_session = self.get_naive_session()
         return self._internal_request(self.naive_session, url, method, **kwargs)
 
     def oauth_request(self, url, method, **kwargs):
@@ -725,47 +708,12 @@ class Connection:
         """
         return self.oauth_request(url, 'delete', **kwargs)
 
-    def _save_token(self, token, token_path=None):
-        """ Save the specified token dictionary to a specified file path
-
-        :param dict token: token dictionary returned by the oauth token request,
-         to be saved
-        :param Path token_path: Path to the file with token information saved
-        :return: Success/Failure
-        :rtype: bool
-        """
-        # TODO: remove this method in future versions
-        warnings.warn('This method is deprecated. Use a TokenBackend instead.', DeprecationWarning)
-        return False
-
-    def _load_token(self, token_path=None):
-        """ Load the specified token dictionary from specified file path
-
-        :param Path token_path: Path to the file with token information saved
-        :return: token data
-        :rtype: dict
-        """
-        # TODO: remove this method in future versions
-        warnings.warn('This method is deprecated. Use a TokenBackend instead.', DeprecationWarning)
-        return False
-
-    def _delete_token(self, token_path=None):
-        """ Delete the specified token dictionary from specified file path
-
-        :param Path token_path: Path to the file with token information saved
-        :return: Success/Failure
-        :rtype: bool
-        """
-        # TODO: remove this method in future versions
-        warnings.warn('This method is deprecated. Use a TokenBackend instead.', DeprecationWarning)
-        return False
-
     def __del__(self):
         """
         Clear the session by closing it
         This should be called manually by the user "del account.con"
         There is no guarantee that this method will be called by the garbage collection
-        But this is not an issue because this connections willbe automatically closed.
+        But this is not an issue because this connections will be automatically closed.
         """
         if self.session:
             self.session.close()
